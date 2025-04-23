@@ -4,6 +4,11 @@ use sha2::{Sha256, Digest};
 use hex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Block {
+    pub header: BlockHeader,
+    pub transactions: Vec<Transaction>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockHeader {
     pub timestamp: i64,
     pub prev_hash: String,
@@ -12,11 +17,6 @@ pub struct BlockHeader {
     pub difficulty: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Block {
-    pub header: BlockHeader,
-    pub transactions: Vec<Transaction>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {

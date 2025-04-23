@@ -59,7 +59,7 @@ impl Blockchain {
         }
     }
 
-    fn calculate_tx_hash(&self, tx: &Transaction) -> String {
+    pub fn calculate_tx_hash(&self, tx: &Transaction) -> String {
         let mut hasher = Sha256::new();
         let serialized = serde_json::to_string(tx).unwrap();
         hasher.update(serialized.as_bytes());
