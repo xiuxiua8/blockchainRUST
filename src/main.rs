@@ -1,6 +1,5 @@
 mod block;
 mod blockchain;
-mod transaction;
 mod wallet;
 mod network;
 
@@ -17,7 +16,7 @@ async fn main() {
     env_logger::init();
 
     // 创建区块链
-    let mut blockchain = blockchain::Blockchain::new(4); // 难度为4
+    let mut blockchain = blockchain::Blockchain::new(2); // 难度为4
     println!("Created new blockchain");
 
     // 创建钱包
