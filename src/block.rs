@@ -59,16 +59,38 @@ impl Block {
     }
 
     pub fn mine(&mut self) {
-        while !self.is_valid() {
+        let max_iterations = 1000000; // 设置一个合理的最大迭代次数
+        let mut iterations = 0;
+        
+        while !self.is_valid() && iterations < max_iterations {
             self.header.nonce += 1;
+            iterations += 1;
+            
+            // 每10000次迭代打印一次进度
+            if iterations % 10000 == 0 {
+                println!("Mining... iterations: {}, nonce: {}", iterations, self.header.nonce);
+            }
+        }
+        
+        if iterations >= max_iterations {
+            println!("挖矿达到最大迭代次数限制，未找到满足条件的哈希");
+        } else {
+            println!("成功挖到区块，迭代次数: {}, nonce: {}", iterations, self.header.nonce);
         }
     }
 
     pub fn is_valid(&self) -> bool {
         let hash = self.calculate_hash();
-        let target = 2u64.pow(256 - self.header.difficulty as u32);
-        let hash_value = u64::from_str_radix(&hash[..16], 16).unwrap();
-        hash_value < target
+        // 检查哈希值前缀是否有足够的0
+        // 简单高效的方法：检查哈希值的前n个字符是否都是0
+        let prefix_zeros = self.header.difficulty as usize;
+        if prefix_zeros == 0 {
+            return true; // 如果难度为0，任何哈希值都有效
+        }
+        
+        // 检查哈希值前缀是否有足够的0
+        let required_prefix = "0".repeat(prefix_zeros);
+        hash.starts_with(&required_prefix)
     }
 }
 
