@@ -21,6 +21,7 @@ libp2p = { version = "0.52.4", features = [
     "identify",
     "async-std",
     "websocket",
+    "gossipsub",
 ]}
 async-trait = "0.1"
 thiserror = "1.0"
@@ -29,5 +30,5 @@ log = "0.4"
 env_logger = "0.10"
 hex = "0.4"
 ripemd = "0.1"
-secp256k1 = { version = "0.24", features = ["rand"] }
+secp256k1 = { version = "0.24", features = ["rand", "serde"] }
 rand = "0.8" 

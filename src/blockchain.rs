@@ -1,16 +1,36 @@
+//! # 区块链模块
+//! 
+//! 实现区块链的核心功能，包括区块链结构、区块添加、UTXO集合管理，以及区块链数据的持久化。
+//! 
+//! 该模块负责管理区块链的状态，包括维护区块列表和未花费交易输出(UTXO)集合。
+
 use std::collections::HashMap;
 use crate::block::{Block, Transaction};
 use std::fs;
 use std::path::Path;
 use sha2::{Sha256, Digest};
 
+/// 区块链结构，包含区块列表、UTXO集合和挖矿难度
 pub struct Blockchain {
+    /// 区块列表，存储链中所有区块
     pub blocks: Vec<Block>,
+    /// UTXO集合，存储未花费的交易输出
+    /// 键为交易ID，值为(输出索引, 金额)元组的列表
     pub utxo_set: HashMap<String, Vec<(u32, u64)>>, // tx_id -> [(output_index, amount)]
+    /// 挖矿难度，影响新区块的哈希要求
     pub difficulty: u64,
 }
 
 impl Blockchain {
+    /// 创建新的区块链
+    ///
+    /// # 参数
+    ///
+    /// * `difficulty` - 挖矿难度
+    ///
+    /// # 返回值
+    ///
+    /// 返回一个带有创世区块的新区块链
     pub fn new(difficulty: u64) -> Self {
         let genesis_block = Block::new(String::from("0"), difficulty);
         let blockchain = Blockchain {
@@ -22,6 +42,11 @@ impl Blockchain {
         blockchain
     }
 
+    /// 向区块链添加新区块
+    ///
+    /// # 参数
+    ///
+    /// * `transactions` - 要包含在新区块中的交易列表
     pub fn add_block(&mut self, transactions: Vec<Transaction>) {
         let prev_block = self.blocks.last().unwrap();
         let prev_hash = prev_block.calculate_hash();
@@ -35,6 +60,9 @@ impl Blockchain {
         self.save_to_file("blockchain.json");
     }
 
+    /// 更新UTXO集合
+    ///
+    /// 遍历区块链中的所有交易，重新构建UTXO集合
     fn update_utxo_set(&mut self) {
         self.utxo_set.clear();
         
@@ -59,6 +87,15 @@ impl Blockchain {
         }
     }
 
+    /// 计算交易哈希值
+    ///
+    /// # 参数
+    ///
+    /// * `tx` - 要计算哈希的交易
+    ///
+    /// # 返回值
+    ///
+    /// 返回计算得到的交易哈希值（16进制字符串）
     pub fn calculate_tx_hash(&self, tx: &Transaction) -> String {
         let mut hasher = Sha256::new();
         let serialized = serde_json::to_string(tx).unwrap();
@@ -66,11 +103,25 @@ impl Blockchain {
         hex::encode(hasher.finalize())
     }
 
+    /// 将区块链数据保存到文件
+    ///
+    /// # 参数
+    ///
+    /// * `filename` - 保存区块链数据的文件名
     pub fn save_to_file(&self, filename: &str) {
         let serialized = serde_json::to_string_pretty(&self.blocks).unwrap();
         fs::write(filename, serialized).expect("Unable to write blockchain to file");
     }
 
+    /// 从文件加载区块链数据
+    ///
+    /// # 参数
+    ///
+    /// * `filename` - 包含区块链数据的文件名
+    ///
+    /// # 返回值
+    ///
+    /// 如果文件存在并且格式正确，返回加载的区块链；否则返回None
     pub fn load_from_file(filename: &str) -> Option<Self> {
         if !Path::new(filename).exists() {
             return None;
@@ -90,13 +141,40 @@ impl Blockchain {
         Some(blockchain)
     }
 
-    pub fn get_balance(&self, _address: &str) -> u64 {
+    /// 获取地址余额
+    ///
+    /// # 参数
+    ///
+    /// * `_address` - 要查询余额的地址
+    ///
+    /// # 返回值
+    ///
+    /// 返回指定地址的余额
+    /// 
+    /// # 注意
+    /// 
+    /// 当前实现计算特定地址的余额
+    pub fn get_balance(&self, address: &str) -> u64 {
         let mut balance = 0;
-        for (_, outputs) in &self.utxo_set {
-            for (_, amount) in outputs {
-                balance += amount;
+        
+        for (tx_id, outputs) in &self.utxo_set {
+            for (output_idx, amount) in outputs {
+                // 查找此交易
+                for block in &self.blocks {
+                    for tx in &block.transactions {
+                        if self.calculate_tx_hash(tx) == *tx_id {
+                            // 检查输出是否属于此地址
+                            if let Some(output) = tx.outputs.get(*output_idx as usize) {
+                                if output.script_pubkey == address {
+                                    balance += amount;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+        
         balance
     }
 }

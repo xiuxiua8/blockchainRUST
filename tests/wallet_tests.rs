@@ -4,14 +4,6 @@ use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 use hex;
 
-// 辅助函数：计算交易哈希，用于测试
-fn calculate_tx_hash(tx: &Transaction) -> String {
-    let mut hasher = Sha256::new();
-    let serialized = serde_json::to_string(tx).unwrap();
-    hasher.update(serialized.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 #[test]
 fn test_wallet_creation() {
     // 创建新钱包
