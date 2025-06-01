@@ -12,13 +12,40 @@ use tokio::sync::mpsc;
 use std::path::Path;
 use std::io::{self, Write};
 use tokio;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::env;
 use std::fs;
 use serde_json;
 use std::sync::Arc;
 
 use network::NetworkEvent;
+
+/// 地址解析函数，将用户友好的名称转换为钱包地址
+async fn resolve_address(
+    input: &str, 
+    address_mapping: &Arc<tokio::sync::Mutex<HashMap<String, String>>>
+) -> String {
+    let mapping = address_mapping.lock().await;
+    
+    // 如果输入已经是有效的钱包地址（40个十六进制字符），直接返回
+    if input.len() == 40 && input.chars().all(|c| c.is_ascii_hexdigit()) {
+        return input.to_string();
+    }
+    
+    // 查找映射表
+    if let Some(address) = mapping.get(input) {
+        // 检查是否是占位符
+        if address.ends_with("_placeholder") {
+            println!("⚠️  警告: '{}' 是占位符地址，请使用菜单选项13更新为实际钱包地址", input);
+            return address.clone();
+        }
+        return address.clone();
+    }
+    
+    // 如果没有找到映射，返回原始输入（可能是新的地址）
+    println!("ℹ️  未找到 '{}' 的地址映射，将作为原始地址使用", input);
+    input.to_string()
+}
 
 /// 程序的主入口函数
 ///
@@ -60,6 +87,34 @@ async fn main() {
     let pending_tx_for_network = pending_transactions.clone();
     let pending_tx_for_main = pending_transactions.clone();
     
+    // 创建地址映射表，支持用户名和节点ID到钱包地址的映射
+    let address_mapping: Arc<tokio::sync::Mutex<HashMap<String, String>>> = 
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let address_mapping_for_network = address_mapping.clone();
+    let address_mapping_for_main = address_mapping.clone();
+    
+    // 添加当前用户的映射
+    {
+        let mut mapping = address_mapping.lock().await;
+        mapping.insert(user_id.to_string(), wallet.address.clone());
+        mapping.insert("me".to_string(), wallet.address.clone());
+        mapping.insert("self".to_string(), wallet.address.clone());
+        
+        // 添加一些常用的用户名映射（用户可以通过菜单13更新）
+        if user_id == "user1" {
+            // 为user1添加user2的预设映射（需要用户手动更新为实际地址）
+            mapping.insert("user2".to_string(), "user2_placeholder".to_string());
+        } else if user_id == "user2" {
+            // 为user2添加user1的预设映射（需要用户手动更新为实际地址）
+            mapping.insert("user1".to_string(), "user1_placeholder".to_string());
+        }
+        
+        println!("📝 地址映射已初始化:");
+        println!("  {} -> {}", user_id, wallet.address);
+        println!("  me -> {}", wallet.address);
+        println!("  self -> {}", wallet.address);
+    }
+    
     // 创建同步状态跟踪
     let sync_in_progress: Arc<tokio::sync::Mutex<bool>> = Arc::new(tokio::sync::Mutex::new(false));
     let sync_state_for_network = sync_in_progress.clone();
@@ -70,9 +125,14 @@ async fn main() {
 
     // 获取网络的事件发送器，用于发送应用层事件到网络
     let network_tx = network.get_event_sender();
+    
+    // 创建网络实例的Arc包装，用于在主循环中访问网络信息
+    let network_for_main = Arc::new(tokio::sync::Mutex::new(network));
+    let network_for_start = network_for_main.clone();
 
     // 启动网络在单独的任务中
     tokio::spawn(async move {
+        let mut network = network_for_start.lock().await;
         if let Err(e) = network.start().await {
             eprintln!("网络启动失败: {}", e);
         }
@@ -99,9 +159,34 @@ async fn main() {
                         println!("✅ 区块验证通过，添加到本地区块链");
                         
                         // 添加区块到本地区块链
-                        blockchain.add_received_block(block);
+                        blockchain.add_received_block(block.clone());
                         
                         println!("本地区块链已更新，当前高度: {}", blockchain.blocks.len());
+                        
+                        // 释放区块链锁，避免死锁
+                        drop(blockchain);
+                        
+                        // 从待处理交易池中移除已经被打包的交易
+                        let mut pending_transactions = pending_tx_for_network.lock().await;
+                        let initial_count = pending_transactions.len();
+                        
+                        // 获取区块中的所有交易哈希
+                        let block_tx_hashes: std::collections::HashSet<String> = block.transactions.iter()
+                            .map(|tx| tx.calculate_hash())
+                            .collect();
+                        
+                        // 保留不在区块中的交易
+                        pending_transactions.retain(|tx| {
+                            let tx_hash = tx.calculate_hash();
+                            !block_tx_hashes.contains(&tx_hash)
+                        });
+                        
+                        let removed_count = initial_count - pending_transactions.len();
+                        if removed_count > 0 {
+                            println!("🗑️ 从待处理池中移除了 {} 个已确认的交易", removed_count);
+                            println!("📊 待处理交易池剩余: {} 个交易", pending_transactions.len());
+                        }
+                        
                     } else {
                         println!("❌ 区块验证失败，可能需要同步区块链");
                         
@@ -174,20 +259,23 @@ async fn main() {
                     }
                 },
                 NetworkEvent::RequestBlocks => {
-                    println!("\n📋 收到区块请求");
+                    println!("\n📋 收到区块同步请求（来自网络）");
                     
                     // 获取区块链的引用
                     let blockchain = blockchain_for_network.lock().await;
                     
-                    // 响应区块请求，发送本地区块链数据
+                    // 发送本地区块链数据作为响应
                     let blocks_to_send = blockchain.blocks.clone();
-                    println!("发送 {} 个区块作为响应", blocks_to_send.len());
+                    println!("响应网络同步请求，发送 {} 个区块", blocks_to_send.len());
                     
-                    // 发送区块响应
+                    // 释放区块链锁
+                    drop(blockchain);
+                    
+                    // 通过网络发送区块链数据响应
                     if let Err(e) = network_tx_for_network.send(NetworkEvent::SendBlocks(blocks_to_send)).await {
-                        eprintln!("发送区块响应失败: {}", e);
+                        eprintln!("发送区块链响应失败: {}", e);
                     } else {
-                        println!("区块响应已发送");
+                        println!("区块链响应已发送");
                     }
                 },
                 NetworkEvent::SendBlocks(blocks) => {
@@ -238,12 +326,39 @@ async fn main() {
                             println!("收到的区块链有效，替换本地链");
                             
                             // 替换本地区块链
-                            blockchain.replace_chain(blocks);
+                            blockchain.replace_chain(blocks.clone());
                             
                             // 更新UTXO集
                             blockchain.rebuild_utxo_set();
                             
                             println!("本地区块链已更新，当前高度: {}", blockchain.blocks.len());
+                            
+                            // 释放区块链锁
+                            drop(blockchain);
+                            
+                            // 更新待处理交易池，移除已经被确认的交易
+                            let mut pending_transactions = pending_tx_for_network.lock().await;
+                            let initial_count = pending_transactions.len();
+                            
+                            // 收集所有区块中的交易哈希
+                            let mut confirmed_tx_hashes = std::collections::HashSet::new();
+                            for block in &blocks {
+                                for tx in &block.transactions {
+                                    confirmed_tx_hashes.insert(tx.calculate_hash());
+                                }
+                            }
+                            
+                            // 保留不在任何区块中的交易
+                            pending_transactions.retain(|tx| {
+                                let tx_hash = tx.calculate_hash();
+                                !confirmed_tx_hashes.contains(&tx_hash)
+                            });
+                            
+                            let removed_count = initial_count - pending_transactions.len();
+                            if removed_count > 0 {
+                                println!("🗑️ 同步后从待处理池中移除了 {} 个已确认的交易", removed_count);
+                                println!("📊 待处理交易池剩余: {} 个交易", pending_transactions.len());
+                            }
                         } else {
                             println!("收到的区块链无效，保留本地链");
                         }
@@ -282,20 +397,36 @@ async fn main() {
                 NetworkEvent::PeerConnected(peer_id) => {
                     println!("\n✅ 节点已连接: {}", peer_id);
                     
+                    // 自动添加节点ID到地址映射表（暂时映射到节点ID本身，用户可以后续更新）
+                    {
+                        let mut mapping = address_mapping_for_network.lock().await;
+                        let peer_id_str = peer_id.to_string();
+                        if !mapping.contains_key(&peer_id_str) {
+                            // 暂时将节点ID映射到自己，用户可以通过菜单选项13更新为实际钱包地址
+                            mapping.insert(peer_id_str.clone(), peer_id_str.clone());
+                            println!("📝 节点ID已添加到地址映射表: {}", peer_id);
+                            println!("💡 提示: 你可以使用菜单选项13将此节点ID映射到实际钱包地址");
+                        }
+                    }
+                    
                     // 检查是否已经在同步中
                     let mut sync_in_progress = sync_state_for_task.lock().await;
                     if !*sync_in_progress {
                         *sync_in_progress = true;
                         drop(sync_in_progress); // 释放锁
                         
-                        // 自动请求区块链同步
-                        println!("自动请求区块链同步...");
+                        // 等待一下让Gossipsub建立网格连接
+                        println!("等待网格连接建立...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        
+                        // 发送网络同步请求（通过网络广播）
+                        println!("发送网络同步请求...");
                         if let Err(e) = network_tx_for_network.send(NetworkEvent::RequestBlocks).await {
-                            eprintln!("自动同步请求失败: {}", e);
+                            eprintln!("发送网络同步请求失败: {}", e);
                             // 重置同步状态
                             *sync_state_for_task.lock().await = false;
                         } else {
-                            println!("已发送区块链同步请求");
+                            println!("网络同步请求已发送");
                         }
                     } else {
                         println!("同步已在进行中，跳过此次同步请求");
@@ -303,7 +434,83 @@ async fn main() {
                 },
                 NetworkEvent::PeerDisconnected(peer_id) => {
                     println!("\n❌ 节点已断开: {}", peer_id);
-                }
+                },
+                NetworkEvent::ConnectionInfo { connected_peers, all_peers } => {
+                    // 处理连接信息响应
+                    println!("当前节点ID: {}", node_peer_id);
+                    println!("连接状态: {} 个连接", connected_peers.len());
+                    println!();
+                    
+                    if connected_peers.is_empty() {
+                        println!("❌ 当前没有连接到任何节点");
+                    } else {
+                        println!("✅ 已连接的节点:");
+                        for (peer_id, addr) in &connected_peers {
+                            println!("  📱 节点ID: {}", peer_id);
+                            if let Some(address) = addr {
+                                println!("     网络地址: {}", address);
+                            }
+                            
+                            // 查找地址映射
+                            let mapping = address_mapping_for_network.lock().await;
+                            let peer_id_str = peer_id.to_string();
+                            if let Some(mapped_addr) = mapping.get(&peer_id_str) {
+                                if mapped_addr != &peer_id_str {
+                                    println!("     钱包地址: {}", mapped_addr);
+                                } else {
+                                    println!("     钱包地址: 未设置 (使用菜单13添加映射)");
+                                }
+                            }
+                            
+                            // 查找用户名映射
+                            let mut user_names = Vec::new();
+                            for (name, addr) in mapping.iter() {
+                                if addr == &peer_id_str && name != &peer_id_str {
+                                    user_names.push(name.clone());
+                                }
+                            }
+                            if !user_names.is_empty() {
+                                println!("     用户名: {}", user_names.join(", "));
+                            }
+                            println!();
+                        }
+                    }
+                    
+                    // 显示已发现但未连接的节点
+                    let disconnected_peers: Vec<_> = all_peers.iter()
+                        .filter(|(_, _, is_connected)| !is_connected)
+                        .collect();
+                        
+                    if !disconnected_peers.is_empty() {
+                        println!("🔍 已发现但未连接的节点:");
+                        for (peer_id, addr, _) in disconnected_peers {
+                            println!("  📱 节点ID: {}", peer_id);
+                            println!("     网络地址: {}", addr);
+                            
+                            // 查找地址映射
+                            let mapping = address_mapping_for_network.lock().await;
+                            let peer_id_str = peer_id.to_string();
+                            if let Some(mapped_addr) = mapping.get(&peer_id_str) {
+                                if mapped_addr != &peer_id_str {
+                                    println!("     钱包地址: {}", mapped_addr);
+                                }
+                            }
+                            println!();
+                        }
+                    }
+                    
+                    // 显示地址映射统计
+                    let mapping = address_mapping_for_network.lock().await;
+                    println!("📋 地址映射统计:");
+                    println!("  总映射数: {}", mapping.len());
+                    let placeholder_count = mapping.values().filter(|v| v.ends_with("_placeholder")).count();
+                    if placeholder_count > 0 {
+                        println!("  占位符映射: {} (需要更新)", placeholder_count);
+                    }
+                    
+                    println!("================\n");
+                },
+                _ => {}
             }
         }
     });
@@ -321,6 +528,10 @@ async fn main() {
         print!("8. Connect to node\n");
         print!("9. Sync blockchain\n");
         print!("10. Show network status\n");
+        print!("11. Debug UTXO set\n");
+        print!("12. Show address mapping\n");
+        print!("13. Add address mapping\n");
+        print!("14. Show connected users\n");
         print!("Enter your choice: ");
         io::stdout().flush().unwrap();
         
@@ -330,10 +541,13 @@ async fn main() {
         match choice.trim() {
             "1" => {
                 // 创建新交易
-                print!("Enter recipient address: ");
+                print!("Enter recipient address (支持: 钱包地址/用户名/节点ID): ");
                 io::stdout().flush().unwrap();
                 let mut to_address = String::new();
                 io::stdin().read_line(&mut to_address).unwrap();
+                
+                // 解析地址
+                let resolved_address = resolve_address(to_address.trim(), &address_mapping_for_main).await;
                 
                 print!("Enter amount: ");
                 io::stdout().flush().unwrap();
@@ -346,7 +560,7 @@ async fn main() {
                 let blockchain_lock = blockchain.lock().await;
                 
                 if let Some(mut tx) = wallet.create_transaction(
-                    to_address.trim(),
+                    &resolved_address,
                     amount,
                     &blockchain_lock.utxo_set,
                 ) {
@@ -363,8 +577,10 @@ async fn main() {
                         eprintln!("Failed to send transaction: {}", e);
                     }
                     println!("Transaction created and added to pending pool!");
+                    println!("发送给: {} (解析为: {})", to_address.trim(), resolved_address);
                 } else {
                     println!("Failed to create transaction: insufficient funds");
+                    println!("目标地址: {} (解析为: {})", to_address.trim(), resolved_address);
                 }
             }
             "2" => {
@@ -489,6 +705,58 @@ async fn main() {
                 println!("自动连接功能已启用");
                 println!("注意: 详细网络状态请查看控制台输出");
                 println!("================\n");
+            }
+            "11" => {
+                // 调试UTXO集
+                print!("Enter address to debug (or press Enter for current user): ");
+                io::stdout().flush().unwrap();
+                let mut debug_address = String::new();
+                io::stdin().read_line(&mut debug_address).unwrap();
+                
+                let address_to_debug = if debug_address.trim().is_empty() {
+                    wallet.address.clone()
+                } else {
+                    debug_address.trim().to_string()
+                };
+                
+                let blockchain_lock = blockchain.lock().await;
+                blockchain_lock.debug_utxo_set(&address_to_debug);
+            }
+            "12" => {
+                // 显示地址映射表
+                println!("\n=== 地址映射表 ===");
+                let mapping = address_mapping.lock().await;
+                for (key, value) in mapping.iter() {
+                    println!("{}: {}", key, value);
+                }
+                println!("================\n");
+            }
+            "13" => {
+                // 添加地址映射
+                print!("Enter address to map: ");
+                io::stdout().flush().unwrap();
+                let mut new_address = String::new();
+                io::stdin().read_line(&mut new_address).unwrap();
+                
+                print!("Enter mapped address: ");
+                io::stdout().flush().unwrap();
+                let mut mapped_address = String::new();
+                io::stdin().read_line(&mut mapped_address).unwrap();
+                
+                let mut mapping = address_mapping.lock().await;
+                mapping.insert(new_address.trim().to_string(), mapped_address.trim().to_string());
+                println!("地址映射已添加");
+            }
+            "14" => {
+                // 显示连接用户信息
+                println!("\n=== 连接用户信息 ===");
+                
+                // 发送连接信息请求
+                if let Err(e) = network_tx.send(NetworkEvent::RequestConnectionInfo).await {
+                    eprintln!("发送连接信息请求失败: {}", e);
+                } else {
+                    println!("正在获取连接信息...");
+                }
             }
             _ => {
                 println!("Invalid choice!");

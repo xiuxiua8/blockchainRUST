@@ -42,6 +42,13 @@ pub enum NetworkEvent {
     PeerConnected(PeerId),
     /// 节点断开事件
     PeerDisconnected(PeerId),
+    /// 请求连接信息事件
+    RequestConnectionInfo,
+    /// 连接信息响应事件
+    ConnectionInfo {
+        connected_peers: Vec<(PeerId, Option<String>)>,
+        all_peers: Vec<(PeerId, String, bool)>,
+    },
 }
 
 /// 网络消息包装结构，用于网络传输
@@ -195,7 +202,12 @@ impl Network {
                 // 配置 gossipsub
                 let gossipsub_config = gossipsub::ConfigBuilder::default()
                     .heartbeat_interval(Duration::from_secs(10))
-                    .validation_mode(gossipsub::ValidationMode::Strict)
+                    .validation_mode(gossipsub::ValidationMode::Permissive)
+                    .mesh_outbound_min(0)
+                    .mesh_n_low(0)
+                    .mesh_n(1)
+                    .mesh_n_high(2)
+                    .gossip_lazy(1)
                     .build()
                     .expect("有效的 gossipsub 配置");
                     
@@ -212,7 +224,12 @@ impl Network {
                     .expect("订阅交易主题失败");
 
                 // 创建 mDNS 行为
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                let mdns_config = mdns::Config {
+                    ttl: Duration::from_secs(60),
+                    query_interval: Duration::from_secs(30),
+                    enable_ipv6: false, // 禁用IPv6以减少接口问题
+                };
+                let mdns = mdns::tokio::Behaviour::new(mdns_config, peer_id)
                     .expect("创建 mDNS 行为失败");
 
                 // 创建 Kademlia DHT 行为
@@ -342,21 +359,27 @@ impl Network {
                 }
             }
             NetworkEvent::RequestBlocks => {
-                println!("广播区块请求");
+                // 广播区块请求，让其他节点响应
+                println!("广播区块同步请求");
                 let message = NetworkMessage::BlockRequest;
                 let data = serde_json::to_vec(&message)?;
                 
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(self.blocks_topic.clone(), data) {
                     eprintln!("广播区块请求失败: {}", e);
+                } else {
+                    println!("区块同步请求已广播");
                 }
             }
             NetworkEvent::SendBlocks(blocks) => {
+                // 广播区块响应，让请求的节点接收
                 println!("广播区块响应，包含 {} 个区块", blocks.len());
                 let message = NetworkMessage::BlockResponse(blocks);
                 let data = serde_json::to_vec(&message)?;
                 
                 if let Err(e) = swarm.behaviour_mut().gossipsub.publish(self.blocks_topic.clone(), data) {
                     eprintln!("广播区块响应失败: {}", e);
+                } else {
+                    println!("区块响应已广播");
                 }
             }
             NetworkEvent::ConnectTo(addr) => {
@@ -365,6 +388,21 @@ impl Network {
                     eprintln!("连接失败: {}", e);
                 } else {
                     println!("连接请求已发送");
+                }
+            }
+            NetworkEvent::RequestConnectionInfo => {
+                // 收集连接信息并发送回应用层
+                let connected_peers = self.get_connected_peers_info();
+                let all_peers = self.get_all_peers_info();
+                
+                if let Some(app_sender) = &self.app_event_sender {
+                    let response = NetworkEvent::ConnectionInfo {
+                        connected_peers,
+                        all_peers,
+                    };
+                    if let Err(e) = app_sender.send(response).await {
+                        eprintln!("发送连接信息响应失败: {}", e);
+                    }
                 }
             }
             _ => {}
@@ -384,6 +422,12 @@ impl Network {
             }
             SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                 for (peer_id, multiaddr) in list {
+                    // 防止自连接：跳过自己的节点ID
+                    if peer_id == self.peer_id {
+                        println!("🚫 跳过自己的节点: {}", peer_id);
+                        continue;
+                    }
+                    
                     println!("🔍 mDNS发现新节点: {} at {}", peer_id, multiaddr);
                     
                     // 自动连接到发现的节点
@@ -416,6 +460,11 @@ impl Network {
                     kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { peers, .. })) => {
                         println!("🌐 Kademlia发现 {} 个节点", peers.len());
                         for peer in peers {
+                            // 防止自连接：跳过自己的节点ID
+                            if peer == self.peer_id {
+                                continue;
+                            }
+                            
                             if self.auto_connect_enabled && 
                                !self.connected_peers.contains(&peer) && 
                                self.connected_peers.len() < self.max_connections {
@@ -436,36 +485,45 @@ impl Network {
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                println!("✅ 已连接到节点: {}", peer_id);
-                self.connected_peers.insert(peer_id);
-                
-                // 发送连接事件
-                if let Err(e) = self.event_sender.send(NetworkEvent::PeerConnected(peer_id)).await {
-                    eprintln!("发送连接事件失败: {}", e);
+                // 检查是否是新连接，避免重复输出
+                if !self.connected_peers.contains(&peer_id) {
+                    self.connected_peers.insert(peer_id);
+                    println!("✅ 新连接建立: {} (总连接数: {})", peer_id, self.connected_peers.len());
+                    
+                    // 发送连接事件到应用层
+                    if let Some(app_sender) = &self.app_event_sender {
+                        if let Err(e) = app_sender.send(NetworkEvent::PeerConnected(peer_id)).await {
+                            eprintln!("发送连接事件到应用层失败: {}", e);
+                        }
+                    }
+                } else {
+                    // 已存在的连接，可能是多个连接到同一节点
+                    // 静默处理，不输出重复信息
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                println!("❌ 与节点断开连接: {}", peer_id);
-                self.connected_peers.remove(&peer_id);
-                
-                // 发送断开事件
-                if let Err(e) = self.event_sender.send(NetworkEvent::PeerDisconnected(peer_id)).await {
-                    eprintln!("发送断开事件失败: {}", e);
-                }
-                
-                // 自动重连机制
-                if self.auto_connect_enabled && self.connected_peers.len() < self.max_connections {
-                    if let Some(addr_str) = self.peers.get(&peer_id) {
-                        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                            println!("🔄 尝试自动重连到: {}", peer_id);
-                            
-                            // 延迟重连，避免立即重连
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            
-                            if let Err(e) = swarm.dial(addr) {
-                                eprintln!("自动重连失败: {}", e);
-                            } else {
-                                println!("已发送自动重连请求");
+                // 只有当节点真正断开时才输出和处理
+                if self.connected_peers.contains(&peer_id) {
+                    self.connected_peers.remove(&peer_id);
+                    println!("❌ 连接断开: {} (剩余连接数: {})", peer_id, self.connected_peers.len());
+                    
+                    // 发送断开事件到应用层
+                    if let Some(app_sender) = &self.app_event_sender {
+                        if let Err(e) = app_sender.send(NetworkEvent::PeerDisconnected(peer_id)).await {
+                            eprintln!("发送断开事件到应用层失败: {}", e);
+                        }
+                    }
+                    
+                    // 自动重连机制（静默处理）
+                    if self.auto_connect_enabled && self.connected_peers.len() < self.max_connections {
+                        if let Some(addr_str) = self.peers.get(&peer_id) {
+                            if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                                // 延迟重连，避免立即重连
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                
+                                if let Err(_e) = swarm.dial(addr) {
+                                    // 静默处理重连失败，避免日志干扰
+                                }
                             }
                         }
                     }
@@ -497,8 +555,9 @@ impl Network {
                         }
                     }
                     Ok(NetworkMessage::BlockRequest) => {
-                        println!("📋 收到区块请求");
-                        // 转发到应用层
+                        // 处理区块请求：响应本地区块链数据
+                        println!("📋 收到区块同步请求，准备响应");
+                        // 转发到应用层处理
                         if let Some(app_sender) = &self.app_event_sender {
                             if let Err(e) = app_sender.send(NetworkEvent::RequestBlocks).await {
                                 eprintln!("转发区块请求到应用层失败: {}", e);
@@ -506,8 +565,9 @@ impl Network {
                         }
                     }
                     Ok(NetworkMessage::BlockResponse(blocks)) => {
-                        println!("📦 收到区块响应，包含 {} 个区块", blocks.len());
-                        // 转发到应用层
+                        // 处理区块响应：接收其他节点的区块链数据
+                        println!("📦 收到区块同步响应，包含 {} 个区块", blocks.len());
+                        // 转发到应用层处理
                         if let Some(app_sender) = &self.app_event_sender {
                             if let Err(e) = app_sender.send(NetworkEvent::SendBlocks(blocks)).await {
                                 eprintln!("转发区块响应到应用层失败: {}", e);
@@ -520,8 +580,16 @@ impl Network {
                 }
             }
             SwarmEvent::Behaviour(MyBehaviourEvent::Ping(ping_event)) => {
-                // 简化ping事件处理，只记录连接活跃状态
-                println!("🏓 Ping事件: {:?}", ping_event);
+                // 只在ping失败或连接问题时输出，减少日志干扰
+                match ping_event.result {
+                    Ok(_) => {
+                        // 成功的ping不输出，避免干扰用户界面
+                        // 可以选择性地记录连接健康状态
+                    }
+                    Err(e) => {
+                        println!("⚠️ Ping失败 {}: {}", ping_event.peer, e);
+                    }
+                }
             }
             _ => {}
         }
@@ -546,6 +614,26 @@ impl Network {
     /// 获取已发现的节点数量
     pub fn discovered_peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    /// 获取连接的节点详细信息
+    pub fn get_connected_peers_info(&self) -> Vec<(PeerId, Option<String>)> {
+        self.connected_peers.iter()
+            .map(|peer_id| {
+                let addr = self.peers.get(peer_id).cloned();
+                (*peer_id, addr)
+            })
+            .collect()
+    }
+    
+    /// 获取所有已发现节点的信息
+    pub fn get_all_peers_info(&self) -> Vec<(PeerId, String, bool)> {
+        self.peers.iter()
+            .map(|(peer_id, addr)| {
+                let is_connected = self.connected_peers.contains(peer_id);
+                (*peer_id, addr.clone(), is_connected)
+            })
+            .collect()
     }
 
     /// 手动触发节点发现

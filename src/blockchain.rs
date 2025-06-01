@@ -101,25 +101,44 @@ impl Blockchain {
     fn update_utxo_set(&mut self) {
         self.utxo_set.clear();
         
+        // 首先添加所有交易的输出
         for block in &self.blocks {
             for tx in &block.transactions {
                 let tx_id = self.calculate_tx_hash(tx);
                 
-                // 处理输出
+                // 添加所有输出到UTXO集
                 for (index, output) in tx.outputs.iter().enumerate() {
                     let outputs = self.utxo_set.entry(tx_id.clone())
                         .or_insert_with(Vec::new);
                     outputs.push((index as u32, output.value));
                 }
-                
-                // 处理输入
+            }
+        }
+        
+        // 然后移除所有被花费的输出
+        for block in &self.blocks {
+            for tx in &block.transactions {
+                // 处理输入，移除已花费的UTXO
                 for input in &tx.inputs {
+                    // 跳过coinbase交易的输入
+                    if input.prev_tx == "0000000000000000000000000000000000000000000000000000000000000000" {
+                        continue;
+                    }
+                    
+                    // 从UTXO集中移除已花费的输出
                     if let Some(outputs) = self.utxo_set.get_mut(&input.prev_tx) {
                         outputs.retain(|&(idx, _)| idx != input.prev_index);
+                        // 如果这个交易的所有输出都被花费了，移除整个条目
+                        if outputs.is_empty() {
+                            self.utxo_set.remove(&input.prev_tx);
+                        }
                     }
                 }
             }
         }
+        
+        // 清理空的条目
+        self.utxo_set.retain(|_, outputs| !outputs.is_empty());
     }
 
     /// 计算交易哈希值
@@ -180,30 +199,33 @@ impl Blockchain {
     ///
     /// # 参数
     ///
-    /// * `_address` - 要查询余额的地址
+    /// * `address` - 要查询余额的地址
     ///
     /// # 返回值
     ///
     /// 返回指定地址的余额
-    /// 
-    /// # 注意
-    /// 
-    /// 当前实现计算特定地址的余额
     pub fn get_balance(&self, address: &str) -> u64 {
         let mut balance = 0;
         
+        // 直接从UTXO集中计算余额，无需遍历所有区块
         for (tx_id, outputs) in &self.utxo_set {
-            for (output_idx, amount) in outputs {
-                // 查找此交易
-                for block in &self.blocks {
-                    for tx in &block.transactions {
-                        if self.calculate_tx_hash(tx) == *tx_id {
-                            // 检查输出是否属于此地址
-                            if let Some(output) = tx.outputs.get(*output_idx as usize) {
-                                if output.script_pubkey == address {
-                                    balance += amount;
-                                }
-                            }
+            // 找到对应的交易来获取输出详情
+            let mut tx_found = None;
+            'outer: for block in &self.blocks {
+                for tx in &block.transactions {
+                    if self.calculate_tx_hash(tx) == *tx_id {
+                        tx_found = Some(tx);
+                        break 'outer;
+                    }
+                }
+            }
+            
+            if let Some(tx) = tx_found {
+                // 检查UTXO集中的每个输出
+                for &(output_idx, _amount) in outputs {
+                    if let Some(output) = tx.outputs.get(output_idx as usize) {
+                        if output.script_pubkey == address {
+                            balance += output.value;
                         }
                     }
                 }
@@ -321,5 +343,48 @@ impl Blockchain {
     /// 重建UTXO集
     pub fn rebuild_utxo_set(&mut self) {
         self.update_utxo_set();
+    }
+    
+    /// 调试UTXO集，显示详细信息
+    pub fn debug_utxo_set(&self, address: &str) {
+        println!("\n=== UTXO集调试信息 ===");
+        println!("查询地址: {}", address);
+        println!("UTXO集总条目数: {}", self.utxo_set.len());
+        
+        let mut total_balance = 0;
+        for (tx_id, outputs) in &self.utxo_set {
+            println!("交易ID: {}", tx_id);
+            
+            // 找到对应的交易
+            let mut tx_found = None;
+            'outer: for block in &self.blocks {
+                for tx in &block.transactions {
+                    if self.calculate_tx_hash(tx) == *tx_id {
+                        tx_found = Some(tx);
+                        break 'outer;
+                    }
+                }
+            }
+            
+            if let Some(tx) = tx_found {
+                for &(output_idx, amount) in outputs {
+                    if let Some(output) = tx.outputs.get(output_idx as usize) {
+                        println!("  输出[{}]: {} -> {} (金额: {})", 
+                                output_idx, output.script_pubkey, 
+                                if output.script_pubkey == address { "✅匹配" } else { "❌不匹配" },
+                                output.value);
+                        
+                        if output.script_pubkey == address {
+                            total_balance += output.value;
+                        }
+                    }
+                }
+            } else {
+                println!("  ⚠️ 找不到对应的交易！");
+            }
+        }
+        
+        println!("计算出的余额: {}", total_balance);
+        println!("===================\n");
     }
 }
