@@ -157,4 +157,16 @@ impl Transaction {
     pub fn new(inputs: Vec<TxInput>, outputs: Vec<TxOutput>) -> Self {
         Transaction { inputs, outputs }
     }
+    
+    /// 计算交易的哈希值
+    ///
+    /// # 返回值
+    ///
+    /// 返回计算得到的交易哈希值（16进制字符串）
+    pub fn calculate_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        let serialized = serde_json::to_string(&self).unwrap();
+        hasher.update(serialized.as_bytes());
+        hex::encode(hasher.finalize())
+    }
 } 

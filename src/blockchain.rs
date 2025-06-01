@@ -11,6 +11,7 @@ use std::path::Path;
 use sha2::{Sha256, Digest};
 
 /// 区块链结构，包含区块列表、UTXO集合和挖矿难度
+#[derive(Clone)]
 pub struct Blockchain {
     /// 区块列表，存储链中所有区块
     pub blocks: Vec<Block>,
@@ -22,24 +23,58 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
-    /// 创建新的区块链
+    /// 创建新的区块链实例
     ///
     /// # 参数
     ///
-    /// * `difficulty` - 挖矿难度
+    /// * `difficulty` - 挖矿难度，影响新区块的哈希要求
     ///
     /// # 返回值
     ///
-    /// 返回一个带有创世区块的新区块链
+    /// 返回初始化的区块链实例，包含创世区块
     pub fn new(difficulty: u64) -> Self {
-        let genesis_block = Block::new(String::from("0"), difficulty);
-        let blockchain = Blockchain {
-            blocks: vec![genesis_block],
+        let mut blockchain = Blockchain {
+            blocks: Vec::new(),
             utxo_set: HashMap::new(),
             difficulty,
         };
-        blockchain.save_to_file("blockchain.json");
+        
+        // 创建固定的创世区块，确保所有节点一致
+        blockchain.create_genesis_block();
+        blockchain.update_utxo_set();
         blockchain
+    }
+    
+    /// 创建固定的创世区块
+    fn create_genesis_block(&mut self) {
+        // 使用固定的时间戳和数据，确保所有节点的创世区块相同
+        let genesis_header = crate::block::BlockHeader {
+            prev_hash: String::from("0"),
+            timestamp: 1748793600, // 固定时间戳：2025-06-01 00:00:00
+            merkle_root: String::from("genesis_merkle_root"), // 固定的默克尔根
+            nonce: 0,
+            difficulty: self.difficulty,
+        };
+        
+        // 创世区块包含一个固定的coinbase交易
+        let genesis_coinbase = crate::block::Transaction::new(
+            vec![crate::block::TxInput {
+                prev_tx: String::from("0000000000000000000000000000000000000000000000000000000000000000"),
+                prev_index: 0,
+                script_sig: String::from("Genesis Block - Blockchain Demo"),
+            }],
+            vec![crate::block::TxOutput {
+                value: 100, // 创世区块奖励
+                script_pubkey: String::from("genesis_address"), // 固定的创世地址
+            }]
+        );
+        
+        let genesis_block = crate::block::Block {
+            header: genesis_header,
+            transactions: vec![genesis_coinbase],
+        };
+        
+        self.blocks.push(genesis_block);
     }
 
     /// 向区块链添加新区块
@@ -176,5 +211,115 @@ impl Blockchain {
         }
         
         balance
+    }
+
+    /// 验证区块是否有效
+    ///
+    /// # 参数
+    ///
+    /// * `block` - 要验证的区块
+    ///
+    /// # 返回值
+    ///
+    /// 如果区块有效返回true，否则返回false
+    pub fn validate_block(&self, block: &Block) -> bool {
+        // 1. 验证区块哈希满足难度要求
+        if !block.is_valid() {
+            println!("区块哈希不满足难度要求");
+            return false;
+        }
+
+        // 2. 验证前一个区块哈希是否匹配
+        if let Some(prev_block) = self.blocks.last() {
+            let prev_hash = prev_block.calculate_hash();
+            if block.header.prev_hash != prev_hash {
+                println!("区块前一个哈希不匹配");
+                return false;
+            }
+        } else if block.header.prev_hash != "0" {
+            // 如果是创世区块，前一个哈希应该是0
+            println!("创世区块前一个哈希应该是0");
+            return false;
+        }
+
+        // 3. 验证所有交易
+        for tx in &block.transactions {
+            if !self.validate_transaction(tx) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// 验证交易是否有效
+    ///
+    /// # 参数
+    ///
+    /// * `transaction` - 要验证的交易
+    ///
+    /// # 返回值
+    ///
+    /// 如果交易有效返回true，否则返回false
+    pub fn validate_transaction(&self, transaction: &Transaction) -> bool {
+        // 1. 验证交易输入引用的UTXO是否存在
+        for input in &transaction.inputs {
+            // 对于Coinbase交易跳过验证
+            if input.prev_tx == "0000000000000000000000000000000000000000000000000000000000000000" {
+                continue;
+            }
+
+            // 检查UTXO是否存在
+            if let Some(outputs) = self.utxo_set.get(&input.prev_tx) {
+                let mut found = false;
+                for &(idx, _) in outputs {
+                    if idx == input.prev_index {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    println!("输入引用的UTXO不存在");
+                    return false;
+                }
+            } else {
+                println!("输入引用的交易不在UTXO集中");
+                return false;
+            }
+        }
+
+        // 2. 验证交易签名 (实际实现中应该验证)
+        // 简化版暂不验证签名
+
+        // 3. 验证输入总额大于等于输出总额
+        // 这需要访问之前的交易，简化版暂不验证
+
+        true
+    }
+
+    /// 添加接收到的区块到区块链
+    ///
+    /// # 参数
+    ///
+    /// * `block` - 要添加的区块
+    pub fn add_received_block(&mut self, block: Block) {
+        self.blocks.push(block);
+        self.update_utxo_set();
+        self.save_to_file("blockchain.json");
+    }
+
+    /// 替换本地链
+    ///
+    /// # 参数
+    ///
+    /// * `blocks` - 新的区块列表
+    pub fn replace_chain(&mut self, blocks: Vec<Block>) {
+        self.blocks = blocks;
+        self.save_to_file("blockchain.json");
+    }
+
+    /// 重建UTXO集
+    pub fn rebuild_utxo_set(&mut self) {
+        self.update_utxo_set();
     }
 }

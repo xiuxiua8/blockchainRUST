@@ -22,6 +22,8 @@ libp2p = { version = "0.52.4", features = [
     "async-std",
     "websocket",
     "gossipsub",
+    "mdns",
+    "kad",
 ]}
 async-trait = "0.1"
 thiserror = "1.0"
